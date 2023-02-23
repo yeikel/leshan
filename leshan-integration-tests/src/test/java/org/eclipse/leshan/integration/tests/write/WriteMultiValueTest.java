@@ -16,6 +16,8 @@
 package org.eclipse.leshan.integration.tests.write;
 
 import static org.eclipse.leshan.core.ResponseCode.CONTENT;
+import static org.eclipse.leshan.integration.tests.util.LeshanTestClientBuilder.givenClientUsing;
+import static org.eclipse.leshan.integration.tests.util.LeshanTestServerBuilder.givenServerUsing;
 import static org.eclipse.leshan.integration.tests.util.TestUtil.assertContentFormat;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.Is.is;
@@ -32,6 +34,7 @@ import java.util.stream.Stream;
 
 import org.eclipse.californium.core.coap.Response;
 import org.eclipse.leshan.core.ResponseCode;
+import org.eclipse.leshan.core.endpoint.Protocol;
 import org.eclipse.leshan.core.model.ResourceModel.Type;
 import org.eclipse.leshan.core.node.LwM2mMultipleResource;
 import org.eclipse.leshan.core.node.LwM2mObjectInstance;
@@ -45,55 +48,89 @@ import org.eclipse.leshan.core.request.WriteRequest.Mode;
 import org.eclipse.leshan.core.response.ReadResponse;
 import org.eclipse.leshan.core.response.WriteResponse;
 import org.eclipse.leshan.core.util.TestLwM2mId;
-import org.eclipse.leshan.integration.tests.util.IntegrationTestHelper;
+import org.eclipse.leshan.integration.tests.util.LeshanTestClient;
+import org.eclipse.leshan.integration.tests.util.LeshanTestServer;
+import org.eclipse.leshan.integration.tests.util.junit5.extensions.ArgumentsUtil;
+import org.eclipse.leshan.integration.tests.util.junit5.extensions.BeforeEachParameterizedResolver;
+import org.eclipse.leshan.server.registration.Registration;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+@ExtendWith(BeforeEachParameterizedResolver.class)
 public class WriteMultiValueTest {
 
-    @ParameterizedTest(name = "{0}")
-    @MethodSource("contentFormats")
+    /*---------------------------------/
+     *  Parameterized Tests
+     * -------------------------------*/
+    @ParameterizedTest(name = "{0} over {1} - Client using {2} - Server using {3}")
+    @MethodSource("transports")
     @Retention(RetentionPolicy.RUNTIME)
-    private @interface TestAllContentFormat {
+    private @interface TestAllCases {
     }
 
-    static Stream<ContentFormat> contentFormats() {
-        return Stream.of(//
+    static Stream<Arguments> transports() {
+
+        Object[][] transports = new Object[][]
+        // ProtocolUsed - Client Endpoint Provider - Server Endpoint Provider
+        { { Protocol.COAP, "Californium", "Californium" } };
+
+        Object[] contentFormats = new Object[] { //
                 ContentFormat.TLV, //
                 ContentFormat.fromCode(ContentFormat.OLD_TLV_CODE), //
                 ContentFormat.fromCode(ContentFormat.OLD_JSON_CODE), //
                 ContentFormat.JSON, //
                 ContentFormat.SENML_JSON, //
-                ContentFormat.SENML_CBOR);
+                ContentFormat.SENML_CBOR //
+        };
+
+        // for each transport, create 1 test by format.
+        return Stream.of(ArgumentsUtil.combine(contentFormats, transports));
     }
 
-    protected IntegrationTestHelper helper = new IntegrationTestHelper();
+    /*---------------------------------/
+     *  Set-up and Tear-down Tests
+     * -------------------------------*/
+
+    LeshanTestServer server;
+    LeshanTestClient client;
+    Registration currentRegistration;
 
     @BeforeEach
-    public void start() {
-        helper.initialize();
-        helper.createServer();
-        helper.server.start();
-        helper.createClient();
-        helper.client.start();
-        helper.waitForRegistrationAtServerSide(1);
+    public void start(ContentFormat contentFormat, Protocol givenProtocol, String givenClientEndpointProvider,
+            String givenServerEndpointProvider) {
+        server = givenServerUsing(givenProtocol).with(givenServerEndpointProvider).build();
+        server.start();
+        client = givenClientUsing(givenProtocol).with(givenClientEndpointProvider).connectingTo(server).build();
+        client.start();
+        server.waitForNewRegistrationOf(client);
+        client.waitForRegistrationTo(server);
+
+        currentRegistration = server.getRegistrationFor(client);
+
     }
 
     @AfterEach
-    public void stop() {
-        helper.client.destroy(false);
-        helper.server.destroy();
-        helper.dispose();
+    public void stop() throws InterruptedException {
+        if (client != null)
+            client.destroy(false);
+        if (server != null)
+            server.destroy();
     }
 
-    @TestAllContentFormat
-    public void can_write_object_instance(ContentFormat contentFormat) throws InterruptedException {
+    /*---------------------------------/
+     *  Tests
+     * -------------------------------*/
+    @TestAllCases
+    public void can_write_object_instance(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         // write device timezone and offset
         LwM2mResource utcOffset = LwM2mSingleResource.newStringResource(14, "+02");
         LwM2mResource timeZone = LwM2mSingleResource.newStringResource(15, "Europe/Paris");
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(),
+        WriteResponse response = server.send(currentRegistration,
                 new WriteRequest(Mode.REPLACE, contentFormat, 3, 0, utcOffset, timeZone));
 
         // verify result
@@ -102,17 +139,17 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read the timezone to check the value changed
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(3, 0));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(3, 0));
         LwM2mObjectInstance instance = (LwM2mObjectInstance) readResponse.getContent();
         assertEquals(utcOffset, instance.getResource(14));
         assertEquals(timeZone, instance.getResource(15));
     }
 
-    @TestAllContentFormat
-    public void can_write_replacing_object_instance(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_write_replacing_object_instance(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         // setup server object
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(),
-                new WriteRequest(contentFormat, 1, 0, 3, 60));
+        WriteResponse response = server.send(currentRegistration, new WriteRequest(contentFormat, 1, 0, 3, 60));
 
         // verify result
         assertEquals(ResponseCode.CHANGED, response.getCode());
@@ -124,8 +161,8 @@ public class WriteMultiValueTest {
         LwM2mResource defaultMinPeriod = LwM2mSingleResource.newIntegerResource(2, 10);
         LwM2mResource notificationStoring = LwM2mSingleResource.newBooleanResource(6, false);
         LwM2mResource binding = LwM2mSingleResource.newStringResource(7, "U");
-        response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(Mode.REPLACE, contentFormat, 1,
-                0, lifetime, defaultMinPeriod, notificationStoring, binding));
+        response = server.send(currentRegistration, new WriteRequest(Mode.REPLACE, contentFormat, 1, 0, lifetime,
+                defaultMinPeriod, notificationStoring, binding));
 
         // verify result
         assertEquals(ResponseCode.CHANGED, response.getCode());
@@ -133,7 +170,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read the values to check the value changed
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(1, 0));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(1, 0));
         LwM2mObjectInstance instance = (LwM2mObjectInstance) readResponse.getContent();
         assertEquals(lifetime, instance.getResource(1));
         assertEquals(defaultMinPeriod, instance.getResource(2));
@@ -142,11 +179,11 @@ public class WriteMultiValueTest {
         assertNull(instance.getResource(3)); // removed not contained optional writable resource
     }
 
-    @TestAllContentFormat
-    public void can_write_updating_object_instance(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_write_updating_object_instance(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         // setup server object
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(),
-                new WriteRequest(contentFormat, 1, 0, 3, 60));
+        WriteResponse response = server.send(currentRegistration, new WriteRequest(contentFormat, 1, 0, 3, 60));
 
         // verify result
         assertEquals(ResponseCode.CHANGED, response.getCode());
@@ -155,7 +192,7 @@ public class WriteMultiValueTest {
         // write server object
         LwM2mResource lifetime = LwM2mSingleResource.newIntegerResource(1, 120);
         LwM2mResource defaultMinPeriod = LwM2mSingleResource.newIntegerResource(2, 10);
-        response = helper.server.send(helper.getCurrentRegistration(),
+        response = server.send(currentRegistration,
                 new WriteRequest(Mode.UPDATE, contentFormat, 1, 0, lifetime, defaultMinPeriod));
 
         // verify result
@@ -164,7 +201,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read the values to check the value changed
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(1, 0));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(1, 0));
         LwM2mObjectInstance instance = (LwM2mObjectInstance) readResponse.getContent();
         assertEquals(lifetime, instance.getResource(1));
         assertEquals(defaultMinPeriod, instance.getResource(2));
@@ -174,8 +211,9 @@ public class WriteMultiValueTest {
         assertNotNull(instance.getResource(7));
     }
 
-    @TestAllContentFormat
-    public void can_write_multi_instance_objlnk_resource(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_write_multi_instance_objlnk_resource(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
 
         Map<Integer, ObjectLink> neighbourCellReport = new HashMap<>();
         neighbourCellReport.put(0, new ObjectLink(10245, 1));
@@ -183,7 +221,7 @@ public class WriteMultiValueTest {
         neighbourCellReport.put(2, new ObjectLink(10244, 3));
 
         // Write objlnk resource in TLV format
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(contentFormat,
+        WriteResponse response = server.send(currentRegistration, new WriteRequest(contentFormat,
                 TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_OBJLINK_VALUE, neighbourCellReport, Type.OBJLNK));
 
         // Verify Write result
@@ -192,7 +230,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // Reading back the written OBJLNK value
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(),
+        ReadResponse readResponse = server.send(currentRegistration,
                 new ReadRequest(TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_OBJLINK_VALUE));
         LwM2mMultipleResource resource = (LwM2mMultipleResource) readResponse.getContent();
 
@@ -205,9 +243,9 @@ public class WriteMultiValueTest {
         assertEquals(((ObjectLink) resource.getValue(2)).getObjectInstanceId(), 3);
     }
 
-    @TestAllContentFormat
-    public void can_write_object_instance_with_empty_multi_resource(ContentFormat contentFormat)
-            throws InterruptedException {
+    @TestAllCases
+    public void can_write_object_instance_with_empty_multi_resource(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
 
         // =============== Try to write ==================
         // /3442/0/1110 : { 0 = "string1", 1 = "string2" }
@@ -227,8 +265,8 @@ public class WriteMultiValueTest {
                 .newIntegerResource(TestLwM2mId.MULTIPLE_INTEGER_VALUE, ints);
 
         // Write new instance
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(Mode.REPLACE,
-                contentFormat, TestLwM2mId.TEST_OBJECT, 0, stringMultiResource, intMultiResource));
+        WriteResponse response = server.send(currentRegistration, new WriteRequest(Mode.REPLACE, contentFormat,
+                TestLwM2mId.TEST_OBJECT, 0, stringMultiResource, intMultiResource));
 
         // Verify Write result
         assertEquals(ResponseCode.CHANGED, response.getCode());
@@ -236,8 +274,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // Reading back the instance
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(),
-                new ReadRequest(TestLwM2mId.TEST_OBJECT, 0));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(TestLwM2mId.TEST_OBJECT, 0));
         LwM2mObjectInstance instance = (LwM2mObjectInstance) readResponse.getContent();
 
         // verify read value
@@ -253,7 +290,7 @@ public class WriteMultiValueTest {
         stringMultiResource = LwM2mMultipleResource.newStringResource(TestLwM2mId.MULTIPLE_STRING_VALUE, strings);
 
         // Write new instance
-        response = helper.server.send(helper.getCurrentRegistration(),
+        response = server.send(currentRegistration,
                 new WriteRequest(Mode.REPLACE, contentFormat, TestLwM2mId.TEST_OBJECT, 0, stringMultiResource));
 
         // Verify Write result
@@ -262,7 +299,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // Reading back the instance
-        readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(TestLwM2mId.TEST_OBJECT, 0));
+        readResponse = server.send(currentRegistration, new ReadRequest(TestLwM2mId.TEST_OBJECT, 0));
         instance = (LwM2mObjectInstance) readResponse.getContent();
 
         // verify read value
@@ -270,8 +307,9 @@ public class WriteMultiValueTest {
         assertNull(instance.getResource(TestLwM2mId.MULTIPLE_INTEGER_VALUE));
     }
 
-    @TestAllContentFormat
-    public void can_write_object_resource_instance(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_write_object_resource_instance(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
 
         // --------------------------------
         // write (replace) multi instance
@@ -280,8 +318,8 @@ public class WriteMultiValueTest {
         values.put(10, "value10");
         values.put(20, "value20");
 
-        WriteResponse response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(Mode.REPLACE,
-                contentFormat, TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE, values, Type.STRING));
+        WriteResponse response = server.send(currentRegistration, new WriteRequest(Mode.REPLACE, contentFormat,
+                TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE, values, Type.STRING));
 
         // Verify Write result
         assertEquals(ResponseCode.CHANGED, response.getCode());
@@ -289,7 +327,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read multi instance
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(),
+        ReadResponse readResponse = server.send(currentRegistration,
                 new ReadRequest(contentFormat, TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE));
 
         // verify result
@@ -306,7 +344,7 @@ public class WriteMultiValueTest {
         Map<Integer, String> newValues = new HashMap<>();
         newValues.put(20, "value200");
         newValues.put(30, "value30");
-        response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(Mode.UPDATE, contentFormat,
+        response = server.send(currentRegistration, new WriteRequest(Mode.UPDATE, contentFormat,
                 TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE, newValues, Type.STRING));
 
         // Verify Write result
@@ -315,7 +353,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read multi instance
-        readResponse = helper.server.send(helper.getCurrentRegistration(),
+        readResponse = server.send(currentRegistration,
                 new ReadRequest(contentFormat, TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE));
 
         // verify result
@@ -332,7 +370,7 @@ public class WriteMultiValueTest {
         // --------------------------------
         newValues = new HashMap<>();
         newValues.put(1, "value1");
-        response = helper.server.send(helper.getCurrentRegistration(), new WriteRequest(Mode.REPLACE, contentFormat,
+        response = server.send(currentRegistration, new WriteRequest(Mode.REPLACE, contentFormat,
                 TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE, newValues, Type.STRING));
 
         // Verify Write result
@@ -341,7 +379,7 @@ public class WriteMultiValueTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read multi instance
-        readResponse = helper.server.send(helper.getCurrentRegistration(),
+        readResponse = server.send(currentRegistration,
                 new ReadRequest(contentFormat, TestLwM2mId.TEST_OBJECT, 0, TestLwM2mId.MULTIPLE_STRING_VALUE));
 
         // verify result

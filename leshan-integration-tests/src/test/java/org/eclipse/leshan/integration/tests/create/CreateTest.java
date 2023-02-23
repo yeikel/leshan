@@ -18,6 +18,8 @@
 
 package org.eclipse.leshan.integration.tests.create;
 
+import static org.eclipse.leshan.integration.tests.util.LeshanTestClientBuilder.givenClientUsing;
+import static org.eclipse.leshan.integration.tests.util.LeshanTestServerBuilder.givenServerUsing;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.Is.is;
 import static org.hamcrest.core.IsInstanceOf.instanceOf;
@@ -32,6 +34,7 @@ import java.util.stream.Stream;
 import org.eclipse.californium.core.coap.Response;
 import org.eclipse.leshan.core.LwM2mId;
 import org.eclipse.leshan.core.ResponseCode;
+import org.eclipse.leshan.core.endpoint.Protocol;
 import org.eclipse.leshan.core.node.LwM2mObject;
 import org.eclipse.leshan.core.node.LwM2mObjectInstance;
 import org.eclipse.leshan.core.node.LwM2mResource;
@@ -42,52 +45,85 @@ import org.eclipse.leshan.core.request.ReadRequest;
 import org.eclipse.leshan.core.request.exception.InvalidRequestException;
 import org.eclipse.leshan.core.response.CreateResponse;
 import org.eclipse.leshan.core.response.ReadResponse;
-import org.eclipse.leshan.integration.tests.util.IntegrationTestHelper;
+import org.eclipse.leshan.integration.tests.util.LeshanTestClient;
+import org.eclipse.leshan.integration.tests.util.LeshanTestServer;
+import org.eclipse.leshan.integration.tests.util.junit5.extensions.ArgumentsUtil;
+import org.eclipse.leshan.integration.tests.util.junit5.extensions.BeforeEachParameterizedResolver;
+import org.eclipse.leshan.server.registration.Registration;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+@ExtendWith(BeforeEachParameterizedResolver.class)
 public class CreateTest {
 
-    @ParameterizedTest(name = "{0}")
-    @MethodSource("contentFormats")
+    /*---------------------------------/
+     *  Parameterized Tests
+     * -------------------------------*/
+    @ParameterizedTest(name = "{0} over {1} - Client using {2} - Server using {3}")
+    @MethodSource("transports")
     @Retention(RetentionPolicy.RUNTIME)
-    private @interface TestAllContentFormat {
+    private @interface TestAllCases {
     }
 
-    static Stream<ContentFormat> contentFormats() {
-        return Stream.of(//
+    static Stream<Arguments> transports() {
+
+        Object[][] transports = new Object[][]
+        // ProtocolUsed - Client Endpoint Provider - Server Endpoint Provider
+        { { Protocol.COAP, "Californium", "Californium" } };
+
+        Object[] contentFormats = new Object[] { //
                 ContentFormat.TLV, //
                 ContentFormat.JSON, //
                 ContentFormat.SENML_JSON, //
-                ContentFormat.SENML_CBOR);
+                ContentFormat.SENML_CBOR };
+
+        // for each transport, create 1 test by format.
+        return Stream.of(ArgumentsUtil.combine(contentFormats, transports));
     }
 
-    protected IntegrationTestHelper helper = new IntegrationTestHelper();
+    /*---------------------------------/
+     *  Set-up and Tear-down Tests
+     * -------------------------------*/
+
+    LeshanTestServer server;
+    LeshanTestClient client;
+    Registration currentRegistration;
 
     @BeforeEach
-    public void start() {
-        helper.initialize();
-        helper.createServer();
-        helper.server.start();
-        helper.createClient();
-        helper.client.start();
-        helper.waitForRegistrationAtServerSide(1);
+    public void start(ContentFormat format, Protocol givenProtocol, String givenClientEndpointProvider,
+            String givenServerEndpointProvider) {
+        server = givenServerUsing(givenProtocol).with(givenServerEndpointProvider).build();
+        server.start();
+        client = givenClientUsing(givenProtocol).with(givenClientEndpointProvider).connectingTo(server).build();
+        client.start();
+        server.waitForNewRegistrationOf(client);
+        client.waitForRegistrationTo(server);
+
+        currentRegistration = server.getRegistrationFor(client);
+
     }
 
     @AfterEach
-    public void stop() {
-        helper.client.destroy(false);
-        helper.server.destroy();
-        helper.dispose();
+    public void stop() throws InterruptedException {
+        if (client != null)
+            client.destroy(false);
+        if (server != null)
+            server.destroy();
     }
 
-    @TestAllContentFormat
-    public void can_create_instance_without_instance_id(ContentFormat contentFormat) throws InterruptedException {
+    /*---------------------------------/
+     *  Tests
+     * -------------------------------*/
+    @TestAllCases
+    public void can_create_instance_without_instance_id(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         try {
             // create ACL instance
-            CreateResponse response = helper.server.send(helper.getCurrentRegistration(),
+            CreateResponse response = server.send(currentRegistration,
                     new CreateRequest(contentFormat, 2, LwM2mSingleResource.newIntegerResource(3, 33)));
 
             // verify result
@@ -97,7 +133,7 @@ public class CreateTest {
             assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
             // create a second ACL instance
-            response = helper.server.send(helper.getCurrentRegistration(),
+            response = server.send(currentRegistration,
                     new CreateRequest(contentFormat, 2, LwM2mSingleResource.newIntegerResource(3, 34)));
 
             // verify result
@@ -107,7 +143,7 @@ public class CreateTest {
             assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
             // read object 2
-            ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(2));
+            ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(2));
             assertEquals(ResponseCode.CONTENT, readResponse.getCode());
             LwM2mObject object = (LwM2mObject) readResponse.getContent();
             assertEquals(33l, object.getInstance(0).getResource(3).getValue());
@@ -118,12 +154,12 @@ public class CreateTest {
         }
     }
 
-    @TestAllContentFormat
-    public void can_create_instance_with_id(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_create_instance_with_id(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         // create ACL instance
         LwM2mObjectInstance instance = new LwM2mObjectInstance(12, LwM2mSingleResource.newIntegerResource(3, 123));
-        CreateResponse response = helper.server.send(helper.getCurrentRegistration(),
-                new CreateRequest(contentFormat, 2, instance));
+        CreateResponse response = server.send(currentRegistration, new CreateRequest(contentFormat, 2, instance));
 
         // verify result
         assertEquals(ResponseCode.CREATED, response.getCode());
@@ -132,18 +168,19 @@ public class CreateTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read object 2
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(2));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(2));
         assertEquals(ResponseCode.CONTENT, readResponse.getCode());
         LwM2mObject object = (LwM2mObject) readResponse.getContent();
         assertEquals(object.getInstance(12).getResource(3).getValue(), 123l);
     }
 
-    @TestAllContentFormat
-    public void can_create_2_instances_of_object(ContentFormat contentFormat) throws InterruptedException {
+    @TestAllCases
+    public void can_create_2_instances_of_object(ContentFormat contentFormat, Protocol givenProtocol,
+            String givenClientEndpointProvider, String givenServerEndpointProvider) throws InterruptedException {
         // create ACL instance
         LwM2mObjectInstance instance1 = new LwM2mObjectInstance(12, LwM2mSingleResource.newIntegerResource(3, 123));
         LwM2mObjectInstance instance2 = new LwM2mObjectInstance(13, LwM2mSingleResource.newIntegerResource(3, 124));
-        CreateResponse response = helper.server.send(helper.getCurrentRegistration(),
+        CreateResponse response = server.send(currentRegistration,
                 new CreateRequest(contentFormat, 2, instance1, instance2));
 
         // verify result
@@ -153,18 +190,19 @@ public class CreateTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // read object 2
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(2));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(2));
         assertEquals(ResponseCode.CONTENT, readResponse.getCode());
         LwM2mObject object = (LwM2mObject) readResponse.getContent();
         assertEquals(object.getInstance(12).getResource(3).getValue(), 123l);
         assertEquals(object.getInstance(13).getResource(3).getValue(), 124l);
     }
 
-    @TestAllContentFormat
-    public void cannot_create_instance_without_all_required_resources(ContentFormat contentFormat)
+    @TestAllCases
+    public void cannot_create_instance_without_all_required_resources(ContentFormat contentFormat,
+            Protocol givenProtocol, String givenClientEndpointProvider, String givenServerEndpointProvider)
             throws InterruptedException {
         // create ACL instance without any resources
-        CreateResponse response = helper.server.send(helper.getCurrentRegistration(), new CreateRequest(contentFormat,
+        CreateResponse response = server.send(currentRegistration, new CreateRequest(contentFormat,
                 LwM2mId.ACCESS_CONTROL, new LwM2mObjectInstance(0, new LwM2mResource[0])));
 
         // verify result
@@ -173,7 +211,7 @@ public class CreateTest {
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
 
         // create ACL instance with only 1 mandatory resources (2 missing)
-        CreateResponse response2 = helper.server.send(helper.getCurrentRegistration(),
+        CreateResponse response2 = server.send(currentRegistration,
                 new CreateRequest(contentFormat, LwM2mId.ACCESS_CONTROL,
                         new LwM2mObjectInstance(0, LwM2mSingleResource.newIntegerResource(LwM2mId.ACL_OBJECT_ID, 12))));
 
@@ -188,7 +226,7 @@ public class CreateTest {
         LwM2mObjectInstance instance1 = new LwM2mObjectInstance(1,
                 LwM2mSingleResource.newIntegerResource(LwM2mId.ACL_OBJECT_ID, 22));
 
-        CreateResponse response3 = helper.server.send(helper.getCurrentRegistration(),
+        CreateResponse response3 = server.send(currentRegistration,
                 new CreateRequest(contentFormat, LwM2mId.ACCESS_CONTROL, instance0, instance1));
 
         // verify result
@@ -196,7 +234,7 @@ public class CreateTest {
 
         // try to read to check if the instance is not created
         // client registration
-        ReadResponse readResponse = helper.server.send(helper.getCurrentRegistration(), new ReadRequest(2, 0));
+        ReadResponse readResponse = server.send(currentRegistration, new ReadRequest(2, 0));
         assertEquals(ResponseCode.NOT_FOUND, readResponse.getCode());
         assertNotNull(response.getCoapResponse());
         assertThat(response.getCoapResponse(), is(instanceOf(Response.class)));
